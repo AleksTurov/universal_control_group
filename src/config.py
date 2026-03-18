@@ -9,7 +9,7 @@ class PathConfig:
     """
     Пути к ресурсам и внешним сервисам.
     """
-    BASEDIR = Path('/data/aturov/universal _control_group/')
+    BASEDIR = Path('/data/aturov/universal_control_group/')
     data_raw_path: Path = BASEDIR / 'data/raw'
     data_processed_path: Path = BASEDIR / 'data/processed'
     data_final_path: Path = BASEDIR / 'data/final'
