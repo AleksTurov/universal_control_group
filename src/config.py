@@ -59,3 +59,5 @@ class DatabaseConfig:
 # Инстансы для импорта из проекта
 path_config = PathConfig()
 database = DatabaseConfig()
+
+
