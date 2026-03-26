@@ -9,15 +9,9 @@ from scipy import stats
 from src.logger import logger
 from src.config import ukg_job_config
 
+from src.stratified_assignment import StratifiedAssigner
 
-
-def normalize_report_slice(df: pd.DataFrame) -> pd.DataFrame:
-    '''Приводит колонки датафрейма к нужным типам и форматам для дальнейшей обработки.'''
-    out = df.copy()
-    out.columns = [str(column) for column in out.columns]
-    if "SUBS_ID" in out.columns:
-        out["SUBS_ID"] = pd.to_numeric(out["SUBS_ID"], errors="coerce").astype("Int64")
-    return out
+assigner = StratifiedAssigner(salt=ukg_job_config.UKG_SALT)
 
 
 def benjamini_hochberg(p_values: pd.Series | list[float]) -> pd.Series:
@@ -115,127 +109,23 @@ def add_behavior_buckets(df: pd.DataFrame) -> tuple[pd.DataFrame, str | None]:
 
     # Выбираем источник монетизации для стратификации по ARPU. Если есть данные по interconnect, то используем их, 
     # иначе берем общий revenue.
-    monetization_col = next((column for column in ukg_job_config.MONETIZATION_SOURCE_PRIORITY if column in out.columns), None)
-    if monetization_col is not None:
-        out["ARPU_BUCKET"] = make_zero_aware_fixed_bucket(
-            out[monetization_col],
+    
+    out["ARPU_BUCKET"] = make_zero_aware_fixed_bucket(
+            out['REVENUE_TOTAL'],
             positive_bins=ukg_job_config.ARPU_POSITIVE_BINS,
             positive_labels=ukg_job_config.ARPU_POSITIVE_LABELS,
             zero_label="ARPU_ZERO",
         )
-    else:
-        out["ARPU_BUCKET"] = "UNKNOWN"
 
-    if "USAGE_INTERNET" in out.columns:
-        out["TRAFFIC_BUCKET"] = make_zero_aware_fixed_bucket(
+    out["TRAFFIC_BUCKET"] = make_zero_aware_fixed_bucket(
             out["USAGE_INTERNET"],
             positive_bins=ukg_job_config.TRAFFIC_POSITIVE_BINS,
             positive_labels=ukg_job_config.TRAFFIC_POSITIVE_LABELS,
             zero_label="TRAFFIC_ZERO",
         )
-    else:
-        out["TRAFFIC_BUCKET"] = "UNKNOWN"
-
-    return out, monetization_col
 
 
-def build_strata_key(df: pd.DataFrame, columns: list[str]) -> pd.Series:
-    '''
-    Создает ключ страты для датафрейма на основе указанных колонок.
-    Если список колонок пуст, возвращает ключ "ALL" для всех строк.
-    '''
-    if not columns:
-        return pd.Series("ALL", index=df.index, dtype="string")
-    prepared = df[columns].copy()
-    for column in columns:
-        prepared[column] = prepared[column].astype("string").fillna("MISSING")
-    return prepared.agg("|".join, axis=1).astype("string")
-
-
-def stable_uint64_hash(values: pd.Series, salt: str) -> pd.Series:
-    '''
-    Создает стабильный uint64-хеш для серии значений с учетом соли. 
-    Используем blake2b с digest_size=8 для получения 64-битного хеша.
-    '''
-    encoded_values = values.astype("string").fillna("MISSING")
-    hashed = [
-        int.from_bytes(
-            hashlib.blake2b(f"{value}|{salt}".encode("utf-8"), digest_size=8).digest(),
-            byteorder="big",
-            signed=False,
-        )
-        for value in encoded_values
-    ]
-    return pd.Series(hashed, index=values.index, dtype="uint64")
-
-
-def assign_control_test_with_strata(
-    df: pd.DataFrame,
-    id_col: str,
-    strata_cols: list[str],
-    control_share: float,
-    salt: str,
-) -> pd.DataFrame:
-    ''' 
-    Проводит стратифицированное рандомизированное распределение между контрольной 
-    и тестовой группой с фиксированным share для контроля.
-     - df: датафрейм с данными для распределения, должен содержать id_col и strata_cols.
-     - id_col: имя колонки с уникальным идентификатором для распределения (например, SUBS_ID).
-     - strata_cols: список колонок для стратификации. Чем больше колонок, тем более однородные страты, но меньше данных в каждой страте.
-     - control_share: доля контрольной группы (например, 0.1 для 10% в контроле).
-     - salt: строка для соления хеша, чтобы обеспечить стабильное распределение между запусками при одинаковых данных.
-    Возвращает датафрейм с добавленными колонками: split_hash (стабильный хеш для распределения), strata_key (ключ страты) и experiment_group (control/test).
-    '''
-    out = df.copy()
-    # Если данных для распределения нет, то возвращаем пустой датафрейм с нужными колонками, чтобы не ломать логику дальше по коду.
-    if out.empty:
-        logger.warning("Нет данных для распределения, возвращаем пустой датафрейм с нужными колонками")
-        out["split_hash"] = pd.Series(dtype="uint64")
-        out["strata_key"] = pd.Series(dtype="string")
-        out["experiment_group"] = pd.Series(dtype="string")
-        out["is_control"] = pd.Series(dtype="uint8")
-        return out
-
-    out["split_hash"] = stable_uint64_hash(out[id_col], salt)
-    out["strata_key"] = build_strata_key(out, strata_cols)
-
-    target_control = int(round(len(out) * control_share))
-    alloc = out.groupby("strata_key").size().rename("n").reset_index()
-    alloc["target_float"] = alloc["n"] * control_share
-    alloc["target_floor"] = np.floor(alloc["target_float"]).astype(int)
-    alloc["fractional"] = alloc["target_float"] - alloc["target_floor"]
-    alloc["k"] = alloc["target_floor"]
-
-    remaining = target_control - int(alloc["target_floor"].sum())
-    if remaining > 0:
-        top_strata = alloc.sort_values(
-            ["fractional", "n", "strata_key"],
-            ascending=[False, False, True],
-            kind="mergesort",
-        ).head(remaining)["strata_key"]
-        alloc.loc[alloc["strata_key"].isin(top_strata), "k"] += 1
-
-    out = out.merge(alloc[["strata_key", "k"]], on="strata_key", how="left")
-    out = out.sort_values(["strata_key", "split_hash", id_col], kind="mergesort").copy()
-    out["_rank"] = out.groupby("strata_key").cumcount() + 1
-    out["experiment_group"] = np.where(out["_rank"] <= out["k"], "control", "test")
-    out["is_control"] = out["experiment_group"].eq("control").astype("uint8")
-    return out.drop(columns=["_rank", "k"])
-
-
-def get_available_strata_columns(df: pd.DataFrame) -> list[str]:
-    '''Возвращает список колонок для стратификации, которые есть в датафрейме, в порядке приоритета CORE_STRATA_COLUMNS.'''
-    return [column for column in ukg_job_config.CORE_STRATA_COLUMNS if column in df.columns]
-
-
-def get_available_ks_columns(df: pd.DataFrame) -> list[str]:
-    '''Возвращает список колонок для KS-проверок, которые есть в датафрейме и являются числовыми, в порядке приоритета KS_COLUMNS.'''
-    return [
-        column
-        for column in ukg_job_config.KS_COLUMNS
-        if column in df.columns and pd.api.types.is_numeric_dtype(df[column])
-    ]
-
+    return out, 'REVENUE_TOTAL'
 
 def merge_existing_and_new_assignments(report_slice_df: pd.DataFrame, new_assignment_df: pd.DataFrame) -> pd.DataFrame:
     '''

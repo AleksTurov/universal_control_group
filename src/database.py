@@ -83,7 +83,6 @@ def render_sql(sql_path: str | Path, **format_params: Any) -> str:
 
 
 def split_sql_statements(sql_script: str) -> list[str]:
-    '''Разбивает SQL-скрипт на отдельные statements, учитывая кавычки и комментарии.'''
     statements: list[str] = []
     buffer: list[str] = []
     in_single_quote = False
@@ -159,6 +158,7 @@ def execute_sql_file(sql_path: str | Path, **format_params: Any) -> None:
 
 
 def query_df(sql_path: str | Path, **query_params: Any) -> pd.DataFrame:
+    '''Выполняет SQL запрос из файла и возвращает результат в виде DataFrame.'''
     sql = read_sql_file(sql_path)
     engine = get_clickhouse_engine()
     with engine.connect() as connection:
@@ -172,6 +172,7 @@ def query_df_from_sql(sql: str, **query_params: Any) -> pd.DataFrame:
 
 
 def query_multiple_dataframes(sql_path: str | Path, **query_params: Any) -> list[pd.DataFrame]:
+    '''Выполняет SQL запрос из файла, который может содержать несколько SQL операторов, и возвращает результат всех SELECT операторов в виде списка DataFrame.'''
     sql_script = read_sql_file(sql_path)
     engine = get_clickhouse_engine()
     result: list[pd.DataFrame] = []
@@ -192,6 +193,7 @@ def insert_dataframe(table_name: str, dataframe: pd.DataFrame) -> None:
 
 
 def ensure_ukg_tables() -> None:
+    '''Создает необходимые таблицы в ClickHouse, если их нет.'''
     execute_sql_file(
         path_config.BASEDIR / "sql" / "03_ukg_assignment_monthly.sql",
         cluster=database.CLICKHOUSE_CLUSTER,
@@ -200,7 +202,6 @@ def ensure_ukg_tables() -> None:
 
 # --- SIMPLE TEST ---
 def test_connections():
-    """Простой тест подключений."""
     results = {}
     
     for name, engine in [('clickhouse', clickhouse_engine)

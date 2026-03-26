@@ -68,7 +68,7 @@ SELECT
     a.ukg_salt AS existing_ukg_salt,
     a.assignment_version AS existing_assignment_version
 FROM DWH.dm_datamart_monthly hs
-GLOBAL ANY LEFT JOIN
+GLOBAL LEFT JOIN
 (
   SELECT
     ua.subs_id,
