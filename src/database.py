@@ -99,6 +99,9 @@ def insert_dataframe(table_name: str, dataframe: pd.DataFrame) -> None:
 class UKGAssignmentRepository:
     """Подготовка и вставка новых assignment-строк в ClickHouse через ORM-модель UkgAssignment."""
 
+    TARGET_TABLE = UkgAssignment.__table__.fullname
+    SOURCE_TABLE = "data_science.ukg_assignment_src"
+
     @staticmethod
     def _model_to_dict(model: UkgAssignment) -> dict[str, Any]:
         return {
@@ -114,6 +117,25 @@ class UKGAssignmentRepository:
             "created_at": model.created_at,
         }
 
+    def delete_rows_for_month(self, report_dt: Any) -> int:
+        """Удаляет existing assignment-строки за конкретный месяц перед rerun."""
+        engine = get_clickhouse_engine()
+        cluster_name = database.CLICKHOUSE_CLUSTER
+
+        count_sql = text(
+            f"SELECT count() AS row_count FROM {self.TARGET_TABLE} WHERE assignment_dt = toDate(:report_dt)"
+        )
+        delete_sql = text(
+            f"ALTER TABLE {self.SOURCE_TABLE} ON CLUSTER {cluster_name} "
+            "DELETE WHERE assignment_dt = toDate(:report_dt) SETTINGS mutations_sync = 2"
+        )
+
+        with engine.begin() as connection:
+            existing_rows = int(connection.execute(count_sql, {"report_dt": report_dt}).scalar() or 0)
+            if existing_rows > 0:
+                connection.execute(delete_sql, {"report_dt": report_dt})
+        return existing_rows
+
     def build_models(
         self,
         new_assignment_df: pd.DataFrame,
@@ -124,6 +146,16 @@ class UKGAssignmentRepository:
     ) -> list[UkgAssignment]:
         if new_assignment_df.empty:
             return []
+
+        duplicate_subs = new_assignment_df.loc[
+            new_assignment_df["SUBS_ID"].duplicated(keep=False),
+            "SUBS_ID",
+        ].drop_duplicates()
+        if not duplicate_subs.empty:
+            raise ValueError(
+                "Нельзя вставлять assignment: найдены дубли по SUBS_ID в new_assignment_df: "
+                f"{duplicate_subs.astype(str).tolist()[:10]}"
+            )
 
         # Сначала приводим типы через DataFrame, затем создаем ORM-объекты.
         created_at = pd.Timestamp.utcnow().tz_localize(None).to_pydatetime()
@@ -155,7 +187,7 @@ class UKGAssignmentRepository:
         except Exception:
             logger.exception("ORM insert в ukg_assignment не удался, fallback на clickhouse client insert_df")
             insert_dataframe(
-                UkgAssignment.__table__.fullname,
+                self.TARGET_TABLE,
                 pd.DataFrame([self._model_to_dict(model) for model in models]),
             )
             return len(models)

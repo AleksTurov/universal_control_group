@@ -151,6 +151,33 @@ class AssignmentChecks:
             "ks_failed_features": ks_failed_features,
         }
 
+    def validate_before_insert(
+        self,
+        new_assignment_df: pd.DataFrame,
+        control_share: float,
+        ks_columns: list[str] | tuple[str, ...],
+        group_column: str = "experiment_group",
+    ) -> dict[str, Any]:
+        srm = self.calculate_srm(new_assignment_df[group_column], control_share=control_share)
+        ks_report = self.run_ks_checks(new_assignment_df, group_column=group_column, ks_columns=ks_columns)
+        checks = self.evaluate_checks(srm=srm, ks_report=ks_report)
+
+        errors: list[str] = []
+        if checks["srm_failed"]:
+            errors.append(f"SRM check не пройден: p_value={checks['srm_p_value']:.6f}")
+        if checks["ks_failed_features"]:
+            errors.append(
+                "KS check не пройден по фичам: " + ", ".join(checks["ks_failed_features"])
+            )
+
+        return {
+            "ok": not errors,
+            "errors": errors,
+            "srm": srm,
+            "ks_report": ks_report,
+            "checks": checks,
+        }
+
     def load_validations(self) -> dict[str, list[dict[str, Any]]]:
         validations: dict[str, list[dict[str, Any]]] = {}
         for name, sql_path in zip(self.validation_names, self.validation_sqls):

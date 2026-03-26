@@ -95,3 +95,4 @@ def merge_existing_and_new_assignments(report_slice_df: pd.DataFrame, new_assign
 
     out["is_control"] = pd.to_numeric(out["is_control"], errors="coerce").fillna(0).astype("uint8")
     return out
+

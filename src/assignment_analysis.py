@@ -8,7 +8,6 @@ import pandas as pd
 from src.assignment_checks import AssignmentChecks
 from src.assignment_plots import AssignmentPlots
 from src.config import analysis_config
-from src.logger import logger
 
 
 class AssignmentAnalyzer:
@@ -61,14 +60,6 @@ class AssignmentAnalyzer:
             strata_cols=strata_cols,
         )
 
-        # Дубли берем из отдельного summary-запроса по всей assignment-таблице.
-        global_summary = validations.get("global_assignment_summary", [])
-        duplicate_rows_cnt = 0
-        if global_summary:
-            duplicate_rows_cnt = int(global_summary[0].get("duplicate_rows_cnt", 0) or 0)
-        if duplicate_rows_cnt > 0:
-            logger.warning("Найдены дубли в assignment по subs_id: %s", duplicate_rows_cnt)
-
         artifacts = self.plots.save_artifacts(
             assignment_df=current_assignment_df,
             ks_report=ks_report,
@@ -79,7 +70,7 @@ class AssignmentAnalyzer:
         )
 
         return {
-            "status": "warning" if (checks["srm_failed"] or checks["ks_failed_features"] or duplicate_rows_cnt > 0) else "ok",
+            "status": "warning" if (checks["srm_failed"] or checks["ks_failed_features"]) else "ok",
             "summary": summary,
             "checks": checks,
             "validations": validations,

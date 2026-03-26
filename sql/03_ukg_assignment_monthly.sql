@@ -1,21 +1,24 @@
 /*
-Инициализация объектов UKG в ClickHouse.
+Пересоздание объектов UKG в ClickHouse.
 
 Назначение файла:
-1) создать persistent-таблицы assignment на всем кластере;
-2) хранить итоговые названия и описания групп прямо в таблице.
+1) удалить старые таблицы assignment на всем кластере;
+2) создать заново source/distributed таблицы для persistent UKG;
+3) вставлять данные в distributed-таблицу data_science.ukg_assignment.
 
 Важно:
-- в этом файле нет логики split;
-- hash, стратификация, SRM и KS считаются в Python job src/app.py;
-- файл выполняется из src/database.py при старте monthly job.
-
-Параметры форматирования:
-- edwh       имя ClickHouse-кластера;
-- data_science имя базы, например DWH.
+- уникальность subs_id дополнительно контролируется в Python job до insert;
+- обычный MergeTree/ReplicatedMergeTree не дает hard unique constraint;
+- hash, стратификация, SRM и KS считаются в Python job src/app.py.
 */
 
-CREATE TABLE IF NOT EXISTS data_science.ukg_assignment_src
+DROP TABLE IF EXISTS data_science.ukg_assignment
+ON CLUSTER edwh;
+
+DROP TABLE IF EXISTS data_science.ukg_assignment_src
+ON CLUSTER edwh;
+
+CREATE TABLE data_science.ukg_assignment_src
 ON CLUSTER edwh
 (
     subs_id UInt64 COMMENT 'Идентификатор абонента (уникальный ключ закрепления в UKG).',
@@ -49,12 +52,13 @@ ON CLUSTER edwh
     assignment_version UInt32 COMMENT 'Версия логики назначения.',
     created_at DateTime DEFAULT now() COMMENT 'Время вставки строки в таблицу assignment.'
 )
-ENGINE = MergeTree
-PARTITION BY toYYYYMM(first_seen_dt)
-ORDER BY (subs_id)
+ENGINE = ReplicatedMergeTree('/clickhouse/tables/{cluster}/data_science/ukg_assignment_src/{shard}',
+ '{replica}')
+PARTITION BY toYYYYMMDD(created_at)
+ORDER BY subs_id
 SETTINGS index_granularity = 8192;
 
-CREATE TABLE IF NOT EXISTS data_science.ukg_assignment
+CREATE TABLE data_science.ukg_assignment
 ON CLUSTER edwh
 AS data_science.ukg_assignment_src
 ENGINE = Distributed(

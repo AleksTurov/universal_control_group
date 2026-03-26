@@ -91,58 +91,80 @@
 
 В репозитории реализован production-friendly pipeline, где:
 
-- Python job в src/app.py считает hash, bucket-признаки, stratified split, SRM и KS;
-- SQL в папке sql отвечает только за DDL, выборку среза и post-run проверки в ClickHouse.
+- Python job в [src/app.py](/data/aturov/universal_control_group/src/app.py) считает hash, bucket-признаки, stratified split, pre-insert проверки и post-run monitoring;
+- SQL в папке `sql` отвечает за DDL, выборку monthly slice и validation-запросы в ClickHouse.
 
 Структура SQL:
 
-- sql/03_ukg_assignment_monthly.sql: создание таблиц и view на кластере;
-- sql/04_ukg_select_report_slice.sql: выборка monthly slice для Python job;
-- sql/05_ukg_validation_queries.sql: контрольные проверки после загрузки.
+- [sql/03_ukg_assignment_monthly.sql](/data/aturov/universal_control_group/sql/03_ukg_assignment_monthly.sql): создание `source` и `distributed` таблиц assignment на кластере;
+- [sql/04_ukg_select_report_slice.sql](/data/aturov/universal_control_group/sql/04_ukg_select_report_slice.sql): выборка monthly slice для Python job;
+- [sql/05_ukg_validation_inserted_rows.sql](/data/aturov/universal_control_group/sql/05_ukg_validation_inserted_rows.sql): контроль вставленных строк за `report_dt`;
+- [sql/06_ukg_validation_global_summary.sql](/data/aturov/universal_control_group/sql/06_ukg_validation_global_summary.sql): глобальный summary по assignment-таблице;
+- [sql/07_ukg_validation_group_summary.sql](/data/aturov/universal_control_group/sql/07_ukg_validation_group_summary.sql): summary по группам `control/test`.
 
 ## Процесс запуска
 
 ### 1. Инициализация
 
-Выполняется автоматически из src/database.py при старте monthly job.
+DDL хранится в [sql/03_ukg_assignment_monthly.sql](/data/aturov/universal_control_group/sql/03_ukg_assignment_monthly.sql) и выполняется отдельно как административная операция.
 
-Если таблиц или view нет на кластере, job сам создаст их через sql/03_ukg_assignment_monthly.sql.
+Python job не создает таблицы автоматически. Он ожидает, что assignment-таблицы уже существуют в ClickHouse.
 
 ### 2. Ежемесячное обновление
 
-Запуск выполняется одной Python-командой:
+Запуск выполняется одной Python-командой с датой в формате `YYYY-MM-DD`:
 
-python -m src.app --report-dt 2026-02-01 --ukg-pct 0.10 --ukg-salt ukg_global_holdout_v1 --assignment-version 4
+python -m src.app 2026-02-01
 
 Что делает job:
 
-1. гарантирует наличие таблиц и view в ClickHouse;
-2. загружает current eligible slice через sql/04_ukg_select_report_slice.sql;
-3. считает все bucket-логики и split только в Python;
-4. вставляет в ClickHouse только новых клиентов;
-5. запускает проверки из sql/05_ukg_validation_queries.sql;
-6. сохраняет audit-артефакты в data/processed.
+1. если это не `dry-run`, удаляет existing assignment-строки за текущий `report_dt` для корректного rerun месяца;
+2. загружает current eligible slice через [sql/04_ukg_select_report_slice.sql](/data/aturov/universal_control_group/sql/04_ukg_select_report_slice.sql);
+3. строит bucket-признаки и выбирает только новых клиентов без historical assignment;
+4. выполняет deterministic stratified split только для новых клиентов;
+5. считает pre-insert checks только на `new_assignment_df`;
+6. строит ORM-модели и вставляет новый monthly batch в ClickHouse;
+7. после вставки считает monitoring на полном текущем assignment slice;
+8. сохраняет summary, validations и артефакты анализа.
 
 Параметры:
 
-- `REPORT_DT`: дата среза.
-- `UKG_PCT`: доля УКГ, например `0.07`.
-- `UKG_SALT`: фиксированная соль назначения.
-- `ASSIGNMENT_VERSION`: версия логики назначения.
+- `report_dt`: дата среза в формате `YYYY-MM-DD`.
+- `UKG_PCT`: целевая доля control.
+- `UKG_SALT`: фиксированная соль для детерминированного assignment.
+- `ASSIGNMENT_VERSION`: версия логики split.
+- `DRY_RUN`: если `True`, delete/insert в ClickHouse не выполняются.
 
-### 3. Контроль качества
+### 3. Перезапуск месяца
+
+Повторный запуск того же месяца должен работать как `delete + reinsert`, а не как полная пересборка всей таблицы.
+
+Это означает:
+
+1. удаляются только строки с `assignment_dt = report_dt`;
+2. затем заново считается и вставляется monthly batch за этот месяц;
+3. historical месяцы не затрагиваются.
+
+Такая схема нужна, чтобы:
+
+- сохранить persistent history;
+- сделать rerun одного месяца безопасным и воспроизводимым;
+- не пересчитывать всю UKG-таблицу без необходимости.
+
+### 4. Контроль качества
 
 Контроль качества выполняется в двух слоях:
 
-- в Python: SRM и KS по текущему eligible slice;
-- в ClickHouse: post-run validation queries по таблице assignment и финальной view.
+- до insert в Python: SRM и KS только по `new_assignment_df`;
+- после insert: monitoring на полном текущем assignment slice;
+- в ClickHouse: post-run validation queries по assignment-таблице.
 
 Проверки:
 
-- Фактическая доля УКГ по всей eligible-базе.
-- KS-баланс по ключевым numeric-полям.
-- Отсутствие дублей в `current`-таблице.
-- Корректность выделения `control slice` для аналитики кампаний.
+- `SRM` по новым назначениям до вставки.
+- `KS` по ключевым numeric-полям до вставки.
+- Monitoring на полном merged slice после вставки.
+- Validation SQL по вставленным строкам, глобальной assignment-таблице и группам `control/test`.
 
 ## Правила аналитического использования
 
@@ -157,8 +179,31 @@ python -m src.app --report-dt 2026-02-01 --ukg-pct 0.10 --ukg-salt ukg_global_ho
 - Не менять `UKG_SALT` без миграционного плана.
 - Не переназначать исторических абонентов.
 - Любое изменение логики фиксировать через `ASSIGNMENT_VERSION`.
+- При rerun месяца удалять и пересобирать только слой `assignment_dt = report_dt`.
 - Перед запуском кампаний использовать `current`-таблицу для глобального исключения УКГ.
 - Не использовать всю УКГ как прямой control для кампаний с узкой целевой популяцией.
+
+## FAQ
+
+### Зачем нужен persistent UKG, а не новый random split каждый месяц?
+
+Чтобы один и тот же абонент не мигрировал между `control` и `test`. Иначе ломается история воздействия и становится сложнее интерпретировать эффект кампаний.
+
+### Почему pre-insert checks считаются только на новых клиентах?
+
+Потому что именно новые клиенты назначаются в текущем запуске. Historical active база со временем может естественно разъезжаться, и это не означает, что текущий monthly split плохой.
+
+### Что считается после вставки?
+
+После insert считается monitoring на полном текущем assignment slice: старые historical назначения плюс новые строки текущего месяца.
+
+### Если на всей базе control и test со временем разъедутся, нужно ли переписывать всю таблицу?
+
+Обычно нет. Сначала нужно проверить, что monthly split для новых клиентов остается качественным. Если разъехалась только вся historical current база, это повод усилить monitoring и при необходимости пересмотреть strata-дизайн для новых месяцев, но не переписывать всю историю автоматически.
+
+### Как правильно перезапускать месяц?
+
+Правильная схема такая: удалить строки с `assignment_dt = report_dt`, заново посчитать batch за этот месяц и вставить его снова. Historical месяцы при этом не трогаются.
 
 ## Связь с churn-инициативой
 

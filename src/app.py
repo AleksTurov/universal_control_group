@@ -13,29 +13,15 @@ from src.database import UKGAssignmentRepository, query_df
 from src.logger import logger
 from src.ukg_job import (
     add_behavior_buckets,
-    merge_existing_and_new_assignments,
-)
-
-
-def _parse_report_dt(raw_value: str) -> date:
-    """Поддерживает запуск как с YYYY-MM-DD, так и с YYYY-MM."""
-    for date_format in ukg_job_config.CLI_DATE_FORMATS:
-        try:
-            parsed = datetime.strptime(raw_value, date_format)
-            if date_format == "%Y-%m":
-                parsed = parsed.replace(day=1)
-            return parsed.date()
-        except ValueError:
-            continue
-
-    raise ValueError(f"Некорректный report_dt: {raw_value}. Ожидается один из форматов: {ukg_job_config.CLI_DATE_FORMATS}")
-
+    merge_existing_and_new_assignments
+    )
 
 def run_job(
     report_dt: date,
 ) -> dict[str, Any]:
     """Запускает полный monthly pipeline для UKG."""
     logger.info("Старт UKG monthly job")
+    repository = UKGAssignmentRepository()
     logger.info(
         "Параметры job: report_dt=%s, ukg_pct=%.5f, ukg_salt=%s, assignment_version=%s, dry_run=%s",
         report_dt,
@@ -44,6 +30,13 @@ def run_job(
         ukg_job_config.ASSIGNMENT_VERSION,
         ukg_job_config.DRY_RUN,
     )
+
+    deleted_rows = 0
+    if ukg_job_config.DRY_RUN:
+        logger.info("Dry-run режим: удаление existing assignment за report_dt пропущено")
+    else:
+        deleted_rows = repository.delete_rows_for_month(report_dt)
+        logger.info("Перед rerun удалено строк за report_dt=%s: %s", report_dt, deleted_rows)
 
     report_slice_df = query_df(path_config.SELECT_SLICE_SQL, DATA_START=report_dt)
     logger.info("Eligible slice: %s строк", len(report_slice_df))
@@ -66,7 +59,25 @@ def run_job(
     )
 
     logger.info("Назначение control/test для новых клиентов выполнено, контроль: %s%%", ukg_job_config.UKG_PCT * 100)
-    repository = UKGAssignmentRepository()
+    current_assignment_df = merge_existing_and_new_assignments(report_slice_df, new_assignment_df)
+    logger.info("Текущий assignment slice собран: %s строк", len(current_assignment_df))
+
+    logger.info("KS колонки: %s", ", ".join(ukg_job_config.KS_COLUMNS))
+    analyzer = build_default_analyzer(
+        report_dt=report_dt,
+        srm_alpha=ukg_job_config.SRM_ALPHA,
+        ks_alpha=ukg_job_config.KS_ALPHA,
+    )
+    preinsert_result = analyzer.checks.validate_before_insert(
+        new_assignment_df=new_assignment_df,
+        control_share=ukg_job_config.UKG_PCT,
+        ks_columns=ukg_job_config.KS_COLUMNS,
+    )
+    if not preinsert_result["ok"]:
+        error_message = "; ".join(preinsert_result["errors"])
+        logger.error("Pre-insert guard не пройден, запись в ClickHouse отменена: %s", error_message)
+        raise ValueError(f"Pre-insert guard failed: {error_message}")
+
     assignment_models = repository.build_models(
         new_assignment_df=new_assignment_df,
         report_dt=report_dt,
@@ -76,22 +87,14 @@ def run_job(
     )
     logger.info("ORM-модели для вставки в ClickHouse подготовлены, строк: %s", len(assignment_models))
 
-    # Собираем финальный срез, где старые назначения сохранены, а новые уже добавлены.
-    current_assignment_df = merge_existing_and_new_assignments(report_slice_df, new_assignment_df)
-    logger.info("Текущий assignment slice собран: %s строк", len(current_assignment_df))
-
+    inserted_rows = 0
     if ukg_job_config.DRY_RUN:
         logger.info("Dry-run режим: загрузка в ClickHouse пропущена")
     else:
         inserted_rows = repository.insert_rows(assignment_models)
         logger.info("В ClickHouse загружено новых строк: %s", inserted_rows)
 
-    logger.info("KS колонки: %s", ", ".join(ukg_job_config.KS_COLUMNS))
-    analyzer = build_default_analyzer(
-        report_dt=report_dt,
-        srm_alpha=ukg_job_config.SRM_ALPHA,
-        ks_alpha=ukg_job_config.KS_ALPHA,
-    )
+    logger.info("Запускаем post-insert monitoring на полном текущем assignment slice")
     analysis_result = analyzer.analyze(
         current_assignment_df=current_assignment_df,
         control_share=ukg_job_config.UKG_PCT,
@@ -99,7 +102,7 @@ def run_job(
         strata_cols=ukg_job_config.CORE_STRATA_COLUMNS,
         split_version=ukg_job_config.DEFAULT_SPLIT_VERSION,
         monetization_col=monetization_col,
-        insert_rows=len(assignment_models),
+        insert_rows=inserted_rows,
     )
     logger.info("Run summary: %s", json.dumps(analysis_result["summary"], ensure_ascii=False))
     logger.info("Artifacts saved to: %s", analyzer.output_dir)
@@ -112,15 +115,16 @@ def run_job(
         "checks": analysis_result["checks"],
         "validations": analysis_result["validations"],
         "artifacts": analysis_result["artifacts"],
-        "insert_rows": int(len(assignment_models)),
+        "insert_rows": int(inserted_rows),
+        "deleted_rows": int(deleted_rows),
         "dry_run": bool(ukg_job_config.DRY_RUN),
     }
 
 
 if __name__ == '__main__':
     if len(sys.argv) > 1:
-        result = run_job(_parse_report_dt(sys.argv[1]))
+        result = run_job((sys.argv[1]))
         print(json.dumps(result, ensure_ascii=False, default=str))
     else:
-        logger.error("Передайте report_dt в формате YYYY-MM-DD или YYYY-MM")
+        logger.error("Передайте report_dt в формате YYYY-MM-DD")
         raise SystemExit(1)
