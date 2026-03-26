@@ -3,6 +3,7 @@ import subprocess
 
 
 def load_vault_env(allowed_prefixes: tuple[str, ...] | None = None) -> None:
+    """Загружает переменные окружения из vault export-скрипта."""
     cmd = (
         "set -a; "
         "source /data/aturov/vault/scripts/export-env.sh kv/data/dev/clickhouse; "
@@ -10,11 +11,11 @@ def load_vault_env(allowed_prefixes: tuple[str, ...] | None = None) -> None:
     )
 
     result = subprocess.run(
-            ["/bin/bash", "-lc", cmd],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
+        ["/bin/bash", "-lc", cmd],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
 
     for line in result.stdout.splitlines():
         if "=" not in line:
@@ -22,5 +23,3 @@ def load_vault_env(allowed_prefixes: tuple[str, ...] | None = None) -> None:
         key, value = line.split("=", 1)
         if allowed_prefixes is None or key.startswith(allowed_prefixes):
             os.environ[key] = value
-
-load_vault_env()

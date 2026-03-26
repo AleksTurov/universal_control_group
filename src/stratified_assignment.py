@@ -7,15 +7,7 @@ import pandas as pd
 
 
 class StratifiedAssigner:
-    """
-    Детерминированное стратифицированное распределение клиентов между
-    control и test.
-
-    Подходит для batch-сценария, где важно:
-    - распределять новых клиентов стабильно;
-    - держать целевую долю control;
-    - воспроизводить assignment между запусками при одинаковом salt.
-    """
+    """Детерминированное распределение клиентов между control и test внутри страт."""
 
     def __init__(self, salt: str) -> None:
         self.salt = salt
@@ -64,43 +56,23 @@ class StratifiedAssigner:
         strata_cols: list[str],
         control_share: float,
     ) -> pd.DataFrame:
-        '''Распределяет строки датафрейма между control и test с учетом страт.
-        Параметры:
-        - df: входной датафрейм с клиентами для назначения.
-        - id_col: колонка с уникальным идентификатором клиента, от которого строится hash.
-        - strata_cols: список колонок для стратификации. Чем больше колонок, тем точнее
-          будет соблюдаться баланс по ним, но меньше клиентов в каждой страти.
-        - control_share: доля клиентов, которая должна попасть в control (например, 0.10 для 10% в control). Должно быть от 0 до 1. 
-        Возвращает датафрейм с добавленной колонкой "experiment_group" со значениями "control" или "test".
-        '''
-        # Работаем с копией, чтобы не мутировать входной датафрейм снаружи.
+        """Распределяет строки между control и test с учетом страт."""
         out = df.copy()
 
-        # Для каждого клиента считаем:
-        # 1) стабильный hash для deterministic порядка;
-        # 2) ключ страты, внутри которой будет идти распределение.
+        # Сначала строим ключ страты и стабильный hash для сортировки внутри нее.
         out["split_hash"] = self.stable_uint64_hash(out[id_col])
         out["strata_key"] = self.build_strata_key(out, strata_cols)
 
-        # Целевое число клиентов в control по всему срезу.
-        # Используем round, чтобы итоговый размер control был максимально
-        # близок к общей доле control_share.
         target_control = int(round(len(out) * control_share))
 
-        # Для каждой страты считаем ожидаемое число control:
-        # n_strata * control_share.
         alloc = out.groupby("strata_key").size().rename("n").reset_index()
         alloc["target_float"] = alloc["n"] * control_share
 
-        # Целую часть забираем сразу.
         alloc["target_floor"] = np.floor(alloc["target_float"]).astype(int)
         alloc["fractional"] = alloc["target_float"] - alloc["target_floor"]
         alloc["k"] = alloc["target_floor"]
 
-        # После floor обычно остаются "недовыданные" места в control.
-        # Их распределяем по стратам с наибольшей дробной частью.
-        # Это стандартная логика largest remainder, она дает общий объем
-        # control максимально близкий к target_control.
+        # Остаток распределяем по стратам с максимальной дробной частью.
         remaining = target_control - int(alloc["target_floor"].sum())
         if remaining > 0:
             top_strata = alloc.sort_values(
@@ -110,11 +82,9 @@ class StratifiedAssigner:
             ).head(remaining)["strata_key"]
             alloc.loc[alloc["strata_key"].isin(top_strata), "k"] += 1
 
-        # Присоединяем k обратно к строкам датафрейма.
         out = out.merge(alloc[["strata_key", "k"]], on="strata_key", how="left")
 
-        # Внутри каждой страты сортируем по стабильному hash.
-        # Первые k строк становятся control, остальные test.
+        # Внутри страты первые k строк уходят в control, остальные в test.
         out = out.sort_values(
             ["strata_key", "split_hash", id_col],
             kind="mergesort",

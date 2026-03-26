@@ -5,7 +5,6 @@ from clickhouse_sqlalchemy.ext.declarative import declarative_base
 
 Base = declarative_base()
 
-
 class DmDatamartMonthly(Base):
     """ORM-модель месячной агрегированной витрины абонентов."""
     __tablename__ = "dm_datamart_monthly"
@@ -118,22 +117,27 @@ class DmDatamartMonthly(Base):
     age = Column("AGE", types.String, nullable=False, comment="Возраст абонента")
 
 
-class HfctSubsShort(Base):
-    """Минимальная ORM-модель витрины подписок для отбора eligible-абонентов."""
-    __tablename__ = "hfct_subs_short"
+
+class UkgAssignment(Base):
+    """ORM-модель таблицы с итоговым UKG assignment."""
+    __tablename__ = "ukg_assignment"
     __table_args__ = (
         engines.Distributed(
             "edwh",
-            "DWH",
-            "hfct_subs_src",
-            "rand()",
+            "data_science",
+            "ukg_assignment_src",
+            "murmurHash3_64(subs_id)",
         ),
-        {"schema": "DWH"},
+        {"schema": "data_science"},
     )
 
-    eff_dt = Column("eff_dt", types.Date, primary_key=True, comment="Дата среза")
-    subscription_id = Column("subscription_id", types.UInt64, primary_key=True, comment="Идентификатор подписки")
-    subs_termination_time = Column("subs_termination_time", types.Nullable(types.DateTime))
-    subs_msisdn = Column("subs_msisdn", types.String, nullable=False, comment="MSISDN абонента")
-    subs_category = Column("subs_category", types.Nullable(types.String))
-    contract_status = Column("contract_status", types.Nullable(types.UInt8))
+    subs_id = Column("subs_id", types.UInt64, primary_key=True, comment="Идентификатор абонента")
+    first_seen_dt = Column("first_seen_dt", types.Date, nullable=False, comment="Дата первого появления в eligible-срезе")
+    assignment_dt = Column("assignment_dt", types.Date, nullable=False, comment="Дата назначения в control/test")
+    experiment_group = Column("experiment_group", types.String, nullable=False, comment="Группа эксперимента: control | test")
+    is_control = Column("is_control", types.UInt8, nullable=False, comment="Флаг контрольной группы")
+    split_hash = Column("split_hash", types.UInt64, nullable=False, comment="Стабильный hash по subs_id и salt")
+    ukg_pct = Column("ukg_pct", types.Float64, nullable=False, comment="Доля control в запуске")
+    ukg_salt = Column("ukg_salt", types.String, nullable=False, comment="Соль hash-функции")
+    assignment_version = Column("assignment_version", types.UInt32, nullable=False, comment="Версия assignment logic")
+    created_at = Column("created_at", types.DateTime, nullable=False, comment="Время вставки строки")
